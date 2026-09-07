@@ -6,12 +6,44 @@ import { createPendingMessage } from 'dashboard/helper/commons';
 import {
   buildConversationList,
   isOnMentionsView,
+  isOnParticipatingView,
   isOnUnattendedView,
   isOnFoldersView,
 } from './helpers/actionHelpers';
 import messageReadActions from './actions/messageReadActions';
 import messageTranslateActions from './actions/messageTranslateActions';
 import * as Sentry from '@sentry/vue';
+import { useAbortableRequest } from 'dashboard/composables/useAbortableRequest';
+import {
+  handleVoiceCallCreated,
+  handleVoiceCallUpdated,
+  syncConversationCallVisibility,
+} from 'dashboard/helper/voice';
+
+const TERMINAL_CONTACT_INFO_REQUEST_STATES = ['shared', 'identity_conflict'];
+
+const contactInfoSourceId = message =>
+  message.conversation?.contact_inbox?.source_id;
+
+const hasContactInfoSource = (conversation, sourceId) => {
+  return (conversation.messages || []).some(message => {
+    return contactInfoSourceId(message) === sourceId;
+  });
+};
+
+const contactInfoRefreshConversationIds = (state, message) => {
+  const conversationIds = new Set([message.conversation_id].filter(Boolean));
+  const sourceId = contactInfoSourceId(message);
+  if (!sourceId) return [...conversationIds];
+
+  (state.allConversations || []).forEach(conversation => {
+    if (hasContactInfoSource(conversation, sourceId)) {
+      conversationIds.add(conversation.id);
+    }
+  });
+
+  return [...conversationIds];
+};
 
 export const hasMessageFailedWithExternalError = pendingMessage => {
   // This helper is used to check if the message has failed with an external error.
@@ -25,49 +57,81 @@ export const hasMessageFailedWithExternalError = pendingMessage => {
   return status === MESSAGE_STATUS.FAILED && externalError !== '';
 };
 
+const conversationListRequest = useAbortableRequest();
+
 // actions
 const actions = {
-  getConversation: async ({ commit }, conversationId) => {
+  getConversation: async ({ commit, dispatch }, conversationId) => {
     try {
       const response = await ConversationApi.show(conversationId);
-      commit(types.UPDATE_CONVERSATION, response.data);
+      // API refreshes can run in the background after reconnecting. Use the
+      // list merge to preserve local message state without moving the agent's
+      // scroll position or marking messages as read.
+      commit(types.SET_ALL_CONVERSATION, [response.data]);
       commit(`contacts/${types.SET_CONTACT_ITEM}`, response.data.meta.sender);
+      dispatch('conversationLabels/setConversationLabel', {
+        id: response.data.id,
+        data: response.data.labels,
+      });
     } catch (error) {
       // Ignore error
     }
   },
 
-  fetchAllConversations: async ({ commit, state, dispatch }) => {
-    commit(types.SET_LIST_LOADING_STATUS);
-    try {
-      const params = state.conversationFilters;
-      const {
-        data: { data },
-      } = await ConversationApi.get(params);
-      buildConversationList(
-        { commit, dispatch },
-        params,
-        data,
-        params.assigneeType
-      );
-    } catch (error) {
-      // Handle error
-    }
+  fetchAllConversations: async (
+    { commit, state, dispatch },
+    { replaceExisting = false } = {}
+  ) => {
+    return conversationListRequest.run(async signal => {
+      commit(types.SET_LIST_LOADING_STATUS);
+      try {
+        const params = state.conversationFilters;
+        const {
+          data: { data },
+        } = await ConversationApi.get(params, { signal });
+
+        if (signal.aborted) return;
+
+        buildConversationList(
+          { commit, dispatch },
+          params,
+          data,
+          params.assigneeType,
+          { replaceExisting }
+        );
+      } catch (error) {
+        if (!signal.aborted) {
+          commit(types.CLEAR_LIST_LOADING_STATUS);
+        }
+      }
+    });
   },
 
   fetchFilteredConversations: async ({ commit, dispatch }, params) => {
-    commit(types.SET_LIST_LOADING_STATUS);
-    try {
-      const { data } = await ConversationApi.filter(params);
-      buildConversationList(
-        { commit, dispatch },
-        params,
-        data,
-        'appliedFilters'
-      );
-    } catch (error) {
-      // Handle error
-    }
+    return conversationListRequest.run(async signal => {
+      const { replaceExisting = false, ...requestParams } = params;
+      commit(types.SET_LIST_LOADING_STATUS);
+      try {
+        const { data } = await ConversationApi.filter(requestParams, {
+          signal,
+        });
+
+        if (signal.aborted) return;
+
+        buildConversationList(
+          { commit, dispatch },
+          requestParams,
+          data,
+          'appliedFilters',
+          { replaceExisting }
+        );
+      } catch (error) {
+        if (signal.aborted) return;
+
+        commit(types.CLEAR_LIST_LOADING_STATUS);
+        throw error;
+      }
+    });
   },
 
   emptyAllConversations({ commit }) {
@@ -92,7 +156,7 @@ const actions = {
         data: payload,
       });
       if (!payload.length) {
-        commit(types.SET_ALL_MESSAGES_LOADED);
+        commit(types.SET_ALL_MESSAGES_LOADED, data.conversationId);
       }
     } catch (error) {
       // Handle error
@@ -187,7 +251,7 @@ const actions = {
 
   async setActiveChat({ commit, dispatch }, { data, after }) {
     commit(types.SET_CURRENT_CHAT_WINDOW, data);
-    commit(types.CLEAR_ALL_MESSAGES_LOADED);
+    commit(types.CLEAR_ALL_MESSAGES_LOADED, data.id);
     if (data.dataFetched === undefined) {
       try {
         await dispatch('fetchPreviousMessages', {
@@ -195,27 +259,38 @@ const actions = {
           before: data.messages[0].id,
           conversationId: data.id,
         });
-        data.dataFetched = true;
+        commit(types.SET_CHAT_DATA_FETCHED, data.id);
       } catch (error) {
         // Ignore error
       }
     }
   },
 
-  assignAgent: async ({ dispatch }, { conversationId, agentId }) => {
+  assignAgent: async (
+    { dispatch },
+    { conversationId, agentId, assigneeType }
+  ) => {
     try {
       const response = await ConversationApi.assignAgent({
         conversationId,
         agentId,
+        assigneeType,
       });
-      dispatch('setCurrentChatAssignee', response.data);
+      dispatch('setCurrentChatAssignee', {
+        conversationId,
+        assignee: response.data,
+        assigneeType,
+      });
     } catch (error) {
       // Handle error
     }
   },
 
-  setCurrentChatAssignee({ commit }, assignee) {
-    commit(types.ASSIGN_AGENT, assignee);
+  setCurrentChatAssignee(
+    { commit },
+    { conversationId, assignee, assigneeType }
+  ) {
+    commit(types.ASSIGN_AGENT, { conversationId, assignee, assigneeType });
   },
 
   assignTeam: async ({ dispatch }, { conversationId, teamId }) => {
@@ -236,9 +311,21 @@ const actions = {
 
   toggleStatus: async (
     { commit },
-    { conversationId, status, snoozedUntil = null }
+    { conversationId, status, snoozedUntil = null, customAttributes = null }
   ) => {
     try {
+      // Update custom attributes first if provided
+      if (customAttributes) {
+        await ConversationApi.updateCustomAttributes({
+          conversationId,
+          customAttributes,
+        });
+        commit(types.UPDATE_CONVERSATION_CUSTOM_ATTRIBUTES, {
+          conversationId,
+          customAttributes,
+        });
+      }
+
       const {
         data: {
           payload: {
@@ -299,7 +386,13 @@ const actions = {
     }
   },
 
-  addMessage({ commit }, message) {
+  requestContactInfo: async ({ commit }, conversationId) => {
+    const { data } = await ConversationApi.requestContactInfo(conversationId);
+    commit(types.ADD_MESSAGE, data);
+    return data;
+  },
+
+  addMessage({ commit, rootGetters }, message) {
     commit(types.ADD_MESSAGE, message);
     if (message.message_type === MESSAGE_TYPE.INCOMING) {
       commit(types.SET_CONVERSATION_CAN_REPLY, {
@@ -308,10 +401,38 @@ const actions = {
       });
       commit(types.ADD_CONVERSATION_ATTACHMENTS, message);
     }
+    handleVoiceCallCreated(
+      message,
+      rootGetters?.getCurrentUserID,
+      rootGetters?.getCurrentUserAvailability
+    );
   },
 
-  updateMessage({ commit }, message) {
+  updateMessage({ commit, dispatch, rootGetters, state }, message) {
     commit(types.ADD_MESSAGE, message);
+
+    const contactInfoRequest =
+      message.content_attributes?.whatsapp_contact_info;
+    const isTerminalContactInfoRequest =
+      contactInfoRequest?.type === 'request' &&
+      (message.status === MESSAGE_STATUS.FAILED ||
+        TERMINAL_CONTACT_INFO_REQUEST_STATES.includes(
+          contactInfoRequest.state
+        ));
+    if (isTerminalContactInfoRequest) {
+      contactInfoRefreshConversationIds(state, message).forEach(
+        conversationId => {
+          dispatch('getConversation', conversationId);
+        }
+      );
+    }
+
+    handleVoiceCallUpdated(
+      commit,
+      message,
+      rootGetters?.getCurrentUserID,
+      rootGetters?.getCurrentUserAvailability
+    );
   },
 
   deleteMessage: async function deleteLabels(
@@ -350,6 +471,7 @@ const actions = {
       !hasAppliedFilters &&
       !isOnFoldersView(rootState) &&
       !isOnMentionsView(rootState) &&
+      !isOnParticipatingView(rootState) &&
       !isOnUnattendedView(rootState) &&
       isMatchingInboxFilter
     ) {
@@ -370,18 +492,18 @@ const actions = {
     }
   },
 
-  updateConversation({ commit, dispatch }, conversation) {
-    const {
-      meta: { sender },
-    } = conversation;
+  updateConversation({ commit, dispatch, rootGetters }, conversation) {
+    const sender = conversation.meta?.sender;
+
     commit(types.UPDATE_CONVERSATION, conversation);
+    syncConversationCallVisibility(conversation, rootGetters?.getCurrentUserID);
 
     dispatch('conversationLabels/setConversationLabel', {
       id: conversation.id,
       data: conversation.labels,
     });
 
-    dispatch('contacts/setContact', sender);
+    if (sender) dispatch('contacts/setContact', sender);
   },
 
   updateConversationLastActivity(
@@ -436,11 +558,7 @@ const actions = {
   },
 
   sendEmailTranscript: async (_, { conversationId, email }) => {
-    try {
-      await ConversationApi.sendEmailTranscript({ conversationId, email });
-    } catch (error) {
-      throw new Error(error);
-    }
+    await ConversationApi.sendEmailTranscript({ conversationId, email });
   },
 
   updateCustomAttributes: async (
@@ -453,9 +571,12 @@ const actions = {
         customAttributes,
       });
       const { custom_attributes } = response.data;
-      commit(types.UPDATE_CONVERSATION_CUSTOM_ATTRIBUTES, custom_attributes);
+      commit(types.UPDATE_CONVERSATION_CUSTOM_ATTRIBUTES, {
+        conversationId,
+        customAttributes: custom_attributes,
+      });
     } catch (error) {
-      // Handle error
+      throw new Error(error);
     }
   },
 
@@ -473,6 +594,11 @@ const actions = {
 
   updateChatListFilters({ commit }, data) {
     commit(types.UPDATE_CHAT_LIST_FILTERS, data);
+  },
+
+  invalidateConversationListRequests({ commit }) {
+    conversationListRequest.abort();
+    commit(types.CLEAR_LIST_LOADING_STATUS);
   },
 
   assignPriority: async ({ dispatch }, { conversationId, priority }) => {
